@@ -1,0 +1,25 @@
+{
+  "name": "antigravity-quota-indicator",
+  "displayName": "Antigravity Live Quota Indicator",
+  "description": "Displays real-time Gemini and Claude model quota usage in the Antigravity IDE Status Bar.",
+  "version": "1.0.0",
+  "publisher": "custom",
+  "engines": {
+    "vscode": "^1.75.0"
+  },
+  "categories": [
+    "Other"
+  ],
+  "activationEvents": [
+    "*"
+  ],
+  "main": "./extension.js",
+  "contributes": {
+    "commands": [
+      {
+        "command": "antigravityQuota.showDetails",
+        "title": "Antigravity: Show Quota Details & Refresh"
+      }
+    ]
+  }
+}
