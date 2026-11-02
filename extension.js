@@ -1,8 +1,9 @@
 const vscode = require('vscode');
 const https = require('https');
+const http = require('http');
 const fs = require('fs');
 const path = require('path');
-const { exec } = require('child_process');
+const { exec, execSync } = require('child_process');
 
 let statusBarItem;
 let updateInterval;
@@ -15,6 +16,7 @@ function getLogPath() {
     if (process.platform === 'win32') {
         const appData = process.env.APPDATA || path.join(home, 'AppData', 'Roaming');
         candidatePaths = [
+            path.join(appData, 'Antigravity IDE', 'logs', 'main.log'),
             path.join(appData, 'Antigravity', 'logs', 'main.log'),
             path.join(appData, 'antigravity', 'logs', 'main.log'),
             path.join(home, '.gemini', 'antigravity', 'logs', 'main.log'),
@@ -22,6 +24,7 @@ function getLogPath() {
         ];
     } else if (process.platform === 'darwin') {
         candidatePaths = [
+            path.join(home, 'Library', 'Application Support', 'Antigravity IDE', 'logs', 'main.log'),
             path.join(home, 'Library', 'Application Support', 'Antigravity', 'logs', 'main.log'),
             path.join(home, 'Library', 'Application Support', 'antigravity', 'logs', 'main.log'),
             path.join(home, 'Library', 'Logs', 'Antigravity', 'main.log'),
@@ -30,6 +33,7 @@ function getLogPath() {
         ];
     } else {
         candidatePaths = [
+            path.join(home, '.config', 'Antigravity IDE', 'logs', 'main.log'),
             path.join(home, '.config', 'Antigravity', 'logs', 'main.log'),
             path.join(home, '.config', 'antigravity', 'logs', 'main.log'),
             path.join(home, '.gemini', 'antigravity', 'logs', 'main.log')
@@ -50,13 +54,13 @@ function parseLog(logPath) {
         let csrfToken = null;
         for (let i = lines.length - 1; i >= 0; i--) {
             const line = lines[i];
-            const matches = line.matchAll(/(?:https?:\/\/127\.0\.0\.1:|127\.0\.0\.1:|localhost:)(\d+)/g);
+            const matches = line.matchAll(/(?:https?:\/\/127\.0\.0\.1:|127\.0\.0\.1:|localhost:|--hub-port[=\s]+)(\d+)/g);
             for (const match of matches) {
                 const p = match[1];
                 if (p && !ports.includes(p)) ports.push(p);
             }
             if (!csrfToken) {
-                const csrfMatch = line.match(/--csrf_token\s+([a-f0-9\-]{36})/);
+                const csrfMatch = line.match(/--csrf_token[=\s]+([a-f0-9\-]{36})/i);
                 if (csrfMatch) csrfToken = csrfMatch[1];
             }
         }
@@ -69,33 +73,51 @@ function parseLog(logPath) {
 function findCandidatesAsync() {
     return new Promise((resolve) => {
         if (process.platform === 'win32') {
-            const psCmd = `powershell -NoProfile -Command "Get-CimInstance Win32_Process -Filter \\"Name like '%language_server%'\\" | Select-Object ProcessId, CommandLine | ConvertTo-Json"`;
+            const psCmd = `powershell -NoProfile -Command "Get-CimInstance Win32_Process -Filter \\"Name like '%language_server%' or Name like '%agy%'\\" | Select-Object ProcessId, CommandLine | ConvertTo-Json"`;
             exec(psCmd, { timeout: 12000 }, (err, stdout) => {
                 if (err || !stdout || !stdout.trim()) return resolve(fallbackLogCandidates());
                 try {
                     const procs = JSON.parse(stdout.trim());
                     const procList = Array.isArray(procs) ? procs : [procs];
-                    const pids = procList.map(p => p.ProcessId).filter(Boolean);
-                    if (pids.length === 0) return resolve(fallbackLogCandidates());
+                    const candidates = [];
+                    const pids = [];
+
+                    for (const proc of procList) {
+                        if (!proc || !proc.CommandLine) continue;
+                        const csrfMatch = proc.CommandLine.match(/--csrf_token[=\s]+([a-f0-9\-]{36})/i);
+                        if (csrfMatch) {
+                            const csrfToken = csrfMatch[1];
+                            if (proc.ProcessId) pids.push(proc.ProcessId);
+                            const hubPortMatch = proc.CommandLine.match(/--hub-port[=\s]+(\d+)/i);
+                            if (hubPortMatch) {
+                                candidates.push({ port: String(hubPortMatch[1]), csrfToken });
+                            }
+                        }
+                    }
+
+                    if (pids.length === 0) return resolve(candidates.length > 0 ? candidates : fallbackLogCandidates());
 
                     const netCmd = `powershell -NoProfile -Command "Get-NetTCPConnection -OwningProcess ${pids.join(',')} -State Listen | Select-Object OwningProcess, LocalPort | ConvertTo-Json"`;
                     exec(netCmd, { timeout: 12000 }, (err2, netOut) => {
-                        if (err2 || !netOut || !netOut.trim()) return resolve(fallbackLogCandidates());
-                        try {
-                            const netObjs = JSON.parse(netOut.trim());
-                            const netList = Array.isArray(netObjs) ? netObjs : [netObjs];
-                            const candidates = [];
-                            for (const n of netList) {
-                                const proc = procList.find(p => p.ProcessId === n.OwningProcess);
-                                if (proc && proc.CommandLine) {
-                                    const csrfMatch = proc.CommandLine.match(/--csrf_token\s+([a-f0-9\-]{36})/i);
-                                    if (csrfMatch) {
-                                        candidates.push({ port: String(n.LocalPort), csrfToken: csrfMatch[1] });
+                        if (!err2 && netOut && netOut.trim()) {
+                            try {
+                                const netObjs = JSON.parse(netOut.trim());
+                                const netList = Array.isArray(netObjs) ? netObjs : [netObjs];
+                                for (const n of netList) {
+                                    const proc = procList.find(p => p.ProcessId === n.OwningProcess);
+                                    if (proc && proc.CommandLine) {
+                                        const csrfMatch = proc.CommandLine.match(/--csrf_token[=\s]+([a-f0-9\-]{36})/i);
+                                        if (csrfMatch) {
+                                            const portStr = String(n.LocalPort);
+                                            if (!candidates.some(c => c.port === portStr && c.csrfToken === csrfMatch[1])) {
+                                                candidates.push({ port: portStr, csrfToken: csrfMatch[1] });
+                                            }
+                                        }
                                     }
                                 }
-                            }
-                            resolve(candidates.length > 0 ? candidates : fallbackLogCandidates());
-                        } catch (e) { resolve(fallbackLogCandidates()); }
+                            } catch (e) {}
+                        }
+                        resolve(candidates.length > 0 ? candidates : fallbackLogCandidates());
                     });
                 } catch (e) { resolve(fallbackLogCandidates()); }
             });
@@ -103,22 +125,29 @@ function findCandidatesAsync() {
         }
 
         // POSIX (macOS / Linux)
-        exec('ps aux | grep -i language_server | grep -v grep', { timeout: 8000 }, (err, stdout) => {
+        exec('ps aux | grep -iE "language_server|agy" | grep -v grep', { timeout: 8000 }, (err, stdout) => {
             if (err || !stdout) return resolve(fallbackLogCandidates());
             const lines = stdout.split('\n');
             const candidates = [];
             for (const line of lines) {
-                const csrfMatch = line.match(/--csrf_token\s+([a-f0-9\-]{36})/i);
+                const csrfMatch = line.match(/--csrf_token[=\s]+([a-f0-9\-]{36})/i);
                 const pidMatch = line.trim().match(/^\S+\s+(\d+)/);
                 if (csrfMatch && pidMatch) {
                     const csrfToken = csrfMatch[1];
                     const pid = pidMatch[1];
+                    const hubPortMatch = line.match(/--hub-port[=\s]+(\d+)/i);
+                    if (hubPortMatch) {
+                        candidates.push({ port: hubPortMatch[1], csrfToken });
+                    }
                     try {
                         const lsof = execSync(`lsof -a -p ${pid} -i -P -n | grep LISTEN`, { encoding: 'utf8', timeout: 3000 });
                         const portMatches = lsof.match(/:(\d+)\s+\(LISTEN\)/g);
                         if (portMatches) {
                             for (const pm of portMatches) {
-                                candidates.push({ port: pm.match(/:(\d+)/)[1], csrfToken });
+                                const portStr = pm.match(/:(\d+)/)[1];
+                                if (!candidates.some(c => c.port === portStr && c.csrfToken === csrfToken)) {
+                                    candidates.push({ port: portStr, csrfToken });
+                                }
                             }
                         }
                     } catch (e) {}
@@ -141,21 +170,24 @@ function fallbackLogCandidates() {
     return candidates;
 }
 
-function fetchUserStatus(port, csrfToken, host = '127.0.0.1') {
+function fetchUserStatusWithProto(proto, port, csrfToken, host = '127.0.0.1') {
     return new Promise((resolve, reject) => {
         const postData = JSON.stringify({});
-        const req = https.request({
+        const options = {
             hostname: host,
             port: port,
             path: '/exa.language_server_pb.LanguageServerService/GetUserStatus',
             method: 'POST',
-            rejectUnauthorized: false,
             headers: {
                 'Content-Type': 'application/json',
                 'x-codeium-csrf-token': csrfToken,
                 'Content-Length': Buffer.byteLength(postData)
             }
-        }, (res) => {
+        };
+        if (proto === https) {
+            options.rejectUnauthorized = false;
+        }
+        const req = proto.request(options, (res) => {
             let data = '';
             res.on('data', (chunk) => data += chunk);
             res.on('end', () => {
@@ -171,10 +203,18 @@ function fetchUserStatus(port, csrfToken, host = '127.0.0.1') {
             });
         });
         req.on('error', (err) => reject(err));
-        req.setTimeout(5000, () => { req.destroy(); reject(new Error("Timeout")); });
+        req.setTimeout(3500, () => { req.destroy(); reject(new Error("Timeout")); });
         req.write(postData);
         req.end();
     });
+}
+
+async function fetchUserStatus(port, csrfToken, host = '127.0.0.1') {
+    try {
+        return await fetchUserStatusWithProto(https, port, csrfToken, host);
+    } catch (e) {
+        return await fetchUserStatusWithProto(http, port, csrfToken, host);
+    }
 }
 
 function formatResetTime(resetValue) {
@@ -250,11 +290,15 @@ async function updateQuotaDisplay() {
             const reset = quota.resetTime;
 
             if (label.includes('gemini')) {
-                if (rem < geminiQuota.remaining) geminiQuota.remaining = rem;
-                if (reset && !geminiQuota.reset) geminiQuota.reset = reset;
+                if (rem <= geminiQuota.remaining) {
+                    geminiQuota.remaining = rem;
+                    if (reset) geminiQuota.reset = reset;
+                }
             } else if (label.includes('claude') || label.includes('gpt')) {
-                if (rem < thirdPartyQuota.remaining) thirdPartyQuota.remaining = rem;
-                if (reset && !thirdPartyQuota.reset) thirdPartyQuota.reset = reset;
+                if (rem <= thirdPartyQuota.remaining) {
+                    thirdPartyQuota.remaining = rem;
+                    if (reset) thirdPartyQuota.reset = reset;
+                }
             }
         }
 
